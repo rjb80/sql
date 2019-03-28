@@ -1,0 +1,648 @@
+﻿CREATE OR REPLACE PROCEDURE TestProcedure
+    (   as_site_gb            IN  VARCHAR2,
+        as_storage_type        IN  VARCHAR2,
+        as_pack_type        IN  VARCHAR2,
+        as_order_dt_from    IN  VARCHAR2,
+        as_order_dt_to        IN  VARCHAR2,
+        as_item_id            IN  VARCHAR2,
+        as_order_type        IN  VARCHAR2,
+        as_upd_id            IN  VARCHAR2,
+        as_vendor_id1       IN  VARCHAR2,
+        as_storage_id1      IN  VARCHAR2,
+        o_err_cd            OUT NUMBER,
+        o_err_msg            OUT VARCHAR2) IS
+/* 변수 선언 ========================================================================================================== */
+
+h_site_gb            VARCHAR2(2)                    :=    TRIM(as_site_gb);           
+h_storage_type        VARCHAR2(1)                    :=    TRIM(as_storage_type);     
+h_pack_type            VARCHAR2(2)                    :=    TRIM(as_pack_type);       
+h_order_dt_from        VARCHAR2(8)                    :=    TRIM(as_order_dt_from);   
+h_order_dt_to        VARCHAR2(8)                    :=    TRIM(as_order_dt_to);       
+h_item_id            VARCHAR2(13)                :=    TRIM(as_item_id);            
+h_order_type        VARCHAR2(2)                    :=    TRIM(as_order_type);       
+h_upd_id            VARCHAR2(9)                    :=    TRIM(as_upd_id);           
+h_vendor_id         VARCHAR2(6)                 :=  TRIM(as_vendor_id1);
+h_storage_id        VARCHAR2(7)                 :=  TRIM(as_storage_id1);
+
+v_temp_row            NUMBER(10)                    := 0;                           
+v_union_apply        VARCHAR2(10)                := '';                           
+v_deli_mth            TestTable0.DELI_MTH%TYPE        := '';
+v_vendor_id            TestTable0.VENDOR_ID%TYPE        := '';
+v_storage_id        TestTable0.STORAGE_ID%TYPE        := '';
+v_deli_id            TestTable0.DELI_ID%TYPE            := '';
+
+v_order_id            TestTable0.ORDER_ID%TYPE        := '';        
+v_order_seq            TestTable0.ORDER_SEQ%TYPE       := '';       
+v_temporary_id        TestTable0.TEMPORARY_ID%TYPE    := '';        
+v_ugt_ship_yn        TestTable0.UGT_SHIP_YN%TYPE        := '';      
+v_deli_accur_yn        TestTable0.DELI_ACCUR_YN%TYPE    := '';      
+v_negative_yn        TestTable0.NEGATIVE_YN%TYPE        := '';      
+v_first_order_gb    TestTable0.FIRST_ORDER_GB%TYPE    := '';      
+v_receipt_dt        TestTable0.RECEIPT_DT%TYPE        := '';      
+v_ship_item_cnt        NUMBER(11)                    := 0 ;   
+v_stock_item_cnt    NUMBER(11)                    := 0 ;      
+v_check_count        NUMBER(11)                    := 0 ;     
+v_user_nm            TestTable1.USER_NM%TYPE            := '';    
+v_user_id            TestTable1.USER_ID%TYPE            := '';    
+v_last_time            NUMBER(11)                    := 0;    
+v_check                CHAR(1);
+
+
+v_order_id_new         TestTable0.ORDER_ID%TYPE        := '';
+v_set_order_seq_new    TestTable0.ORDER_SEQ%TYPE       := '';
+v_ship_yn_new              VARCHAR2(2)                 := '';
+
+/* =============================================================================================================
+  
+   ============================================================================================================= */
+
+    CURSOR    TestProcedure_CURSOR_01 IS
+    SELECT    /*+ TestProcedure_CURSOR_01 - 출고지시 번호 분리를 위한 커서 */
+            DISTINCT order_id, DECODE(union_apply, '02', TO_CHAR(ROWNUM), union_apply), deli_mth, vendor_id, storage_id, deli_id, order_seq
+      FROM    TestTable0
+     WHERE    create_type  = h_storage_type
+     ORDER    BY   order_id, DECODE(union_apply, '02', TO_CHAR(ROWNUM), union_apply), deli_mth, vendor_id, storage_id, deli_id;
+
+    CURSOR    TestProcedure_CURSOR_02 IS
+    SELECT    /*+ TestProcedure_CURSOR - 출고지시 대상 우선순위를 정하기 위한 커서 */
+            DISTINCT order_id,      temporary_id
+                   , ugt_ship_yn, deli_accur_yn, negative_yn,    first_order_gb, receipt_dt
+      FROM    TestTable0
+     WHERE    create_type  = h_storage_type
+       AND  create_id    = h_upd_id
+     ORDER    BY   deli_accur_yn, ugt_ship_yn, negative_yn, first_order_gb, receipt_dt, order_id;
+     
+     
+    CURSOR    TestProcedure_TESTA_CURSOR_03 IS
+    SELECT    /*+ TestProcedure_TESTA_CURSOR - 출고지시 셋트건 필터링을 위한 커서 */
+            order_id,set_order_seq,max(ship_yn)
+      FROM    TestTable0
+     WHERE    create_type  = h_storage_type
+       AND  create_id    = h_upd_id
+       and  set_gb ='04'
+     group by order_id,set_order_seq
+     ORDER    BY   order_id,set_order_seq;          
+     
+
+BEGIN
+-- 1. 일괄출고지시 작업중인지 확인한다. -----------------------------------------------------------------------------------
+    BEGIN
+          SELECT /*+ ordered use_nl(a b) - TestProcedure    */
+               b.user_nm
+          INTO v_user_nm
+          FROM TestTable0 a, TestTable1 b
+         WHERE a.create_type = h_storage_type
+           AND a.run_yn = '01'
+           AND a.create_id = b.user_id
+           AND ROWNUM = 1;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+             v_user_nm := NULL;
+           WHEN OTHERS THEN
+             o_err_cd  := -20001;
+             o_err_msg := '20001-일괄출고지시 작업중입니다.(TestProcedure)';
+               RETURN;
+    END;
+
+    IF v_user_nm != NULL  THEN
+         o_err_cd  := -20001;
+         o_err_msg := '20001-사용자 ' || v_user_nm || '이(가) 출고지시 작업중입니다.(TestProcedure)';
+         RETURN;
+    END IF;
+
+-- 2. 사용자가 생성한 작업구분별 최종 시간을 구한다 -----------------------------------------------------------------------
+    BEGIN
+         SELECT    /*+ TestProcedure    */
+                 TRUNC((SYSDATE - TO_DATE(create_time,'YYYYMMDDHH24MISS')) * 24 * 60, 0), create_id
+           INTO v_last_time, v_user_id
+           FROM TestTable0
+          WHERE    create_type = h_storage_type
+            AND ROWNUM = 1;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+             o_err_cd  := 0;
+           WHEN OTHERS THEN
+             o_err_cd  := -20002;
+             o_err_msg := '20002-출고지시 예상 자료 생성 오류.(TestProcedure)';
+               RETURN;
+    END;
+
+    IF    v_user_id != h_upd_id    THEN
+        IF    v_last_time <= 30 THEN
+             o_err_cd  := -20003;
+             o_err_msg := '20003-출고지시 작업중입니다.(TestProcedure)';
+             RETURN;
+        END IF;
+    END IF;
+
+-- 3. 사용자가 전에 생성했던 자료 지우기 ----------------------------------------------------------------------------------
+    BEGIN
+        DELETE    /*+ TestProcedure - 출고지시예상 삭제 */
+        FROM    TestTable0
+        WHERE    CREATE_TYPE = h_storage_type ;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+             o_err_cd  := 0;
+           WHEN OTHERS THEN
+             o_err_cd  := -20004;
+             o_err_msg := '20004-출고지시 예상 자료 삭제 오류.(TestProcedure)';
+               RETURN;
+    END;
+
+-- 4. 출고지시 예상조회 신규생성 ------------------------------------------------------------------------------------------
+-- ------------------------------------------------------------------------------------
+    BEGIN
+       IF h_storage_type = '1'    THEN
+          INSERT INTO TestTable0(CREATE_TYPE, CREATE_ID, ORDER_ID, ORDER_SEQ, DELI_MTH, VENDOR_ID, STORAGE_ID,
+                                 UNION_APPLY, ASSORT_ID, ITEM_ID, ORDER_QTY, SET_GB, FIRST_ORDER_GB, RECEIPT_DT,
+                              UGT_SHIP_YN, DELI_ID, DELI_ZIP, DELI_ACCUR_YN, DELI_DT, DELI_GB, MBE_VENDOR_ID,
+                              STOCK_QTY, SHIP_YN, NEGATIVE_YN, TEMPORARY_ID, CREATE_TIME, RUN_YN, CNT,SET_ORDER_SEQ)
+                SELECT  h_storage_type,    h_upd_id,            V1.order_id,        V1.order_seq,        V1.deli_mth
+                       ,V1.vendor_id,        V1.storage_id,        V1.union_apply,        V1.assort_id,        V1.item_id
+                       ,V1.order_qty,        V1.set_gb,            V1.first_order_gb,    V1.receipt_dt,        V1.ugt_ship_yn
+                       ,V1.deli_id,            V1.deli_zip,        V1.deli_accur_yn,    V1.deli_dt,            V1.deli_gb
+                       ,V1.mbe_vendor_id,    (nvl(V1.stock_qty,0) - nvl(V1.run_sum_order_qty,0)), -- V1.stock_qty,
+                       decode(sign(nvl(stock_qty,0) - nvl(run_sum_order_qty,0)),-1,'02','01') ship_yn
+                       ,V1.negative_yn,     LPAD(V1.RNUM,9,'0') TEMPORARY_ID,       TO_CHAR(SYSDATE,'YYYYMMDDHH24MISS'), '02', V1.cnt
+                       ,set_order_seq
+                  FROM ( 
+                              SELECT    aa.order_id,        aa.order_seq,        aa.deli_mth         ,    aa.vendor_id,        aa.storage_id
+                                 ,    aa.union_apply,        aa.assort_id,        aa.item_id         ,    aa.order_qty,        aa.set_gb
+                                 ,    aa.first_order_gb,    aa.receipt_dt,        aa.ugt_ship_yn     ,    aa.deli_id,            aa.deli_zip
+                                 ,    aa.deli_accur_yn,    aa.deli_dt,            aa.deli_gb         ,    aa.mbe_vendor_id--,    aa.ship_yn
+                                 ,    nvl(aa.negative_yn,'02') negative_yn,   
+                                 (select /*+INDEX( X TestTable2_PK) */ sum(qty - ship_indicate_qty)
+                                    from TestTable2 X
+                                   where aa.storage_id = storage_id
+                                     and aa.assort_id  = assort_id
+                                     and aa.item_id       = item_id
+                                     and item_grade       ='11') stock_qty
+                                 , ( (dense_rank() over(order by aa.order_id, aa.deli_id,aa.union_apply,aa.add_deli_gb,aa.ship_vendor_id)) + 100000000) rnum /* */
+                                 ,  sum(1)         over(partition by aa.order_id, aa.deli_id,aa.union_apply,aa.add_deli_gb,aa.ship_vendor_id) cnt
+                                 ,  sum(order_qty) over(partition by aa.assort_id, aa.item_id
+                                                            order by aa.deli_accur_yn, aa.ugt_ship_yn, nvl(aa.negative_yn,'02'), aa.first_order_gb,
+                                                                     aa.receipt_dt, aa.order_id) run_sum_order_qty
+                                 ,aa.set_order_seq                                    
+                              FROM (SELECT    /*+ ORDERED USE_NL(b a c d e) index(b TestTable3_IND6) - TestProcedure  */
+                                                 b.order_id,    b.order_seq,    c.deli_mth deli_mth
+                                         ,    '002301' vendor_id
+                                         ,     c.storage_id, DECODE(union_apply, '02', TO_CHAR(ROWNUM), union_apply) union_apply,    b.assort_id
+                                         ,    b.item_id,    b.order_qty,     b.set_gb,    NVL(a.first_order_gb,'02') first_order_gb
+                                         ,    a.receipt_dt,    NVL(a.ugt_ship_yn,'02') ugt_ship_yn
+                                         ,    b.deli_id,    d.deli_zip,    NVL(d.deli_accur_yn,'02') deli_accur_yn
+                                         ,    d.deli_dt,    d.deli_gb,    d.vendor_id mbe_vendor_id
+                                         , (SELECT    /*+ index( k TestTable4_IND2) - TestProcedure */ '01'
+                                               FROM    TestTable4 k
+                                             WHERE    k.order_id   = a.order_id
+                                               AND    k.reason_bcd = '02'
+                                               AND  ROWNUM <= 1) negative_yn
+                                         ,b.set_order_seq   
+                                         ,c.add_deli_gb   
+                                         ,decode(e.vd_type_cd,'0425',c.vendor_id, decode(c.vendor_id,'132141','132141','132541','132541','134447','134447','002301')) ship_vendor_id
+                                      FROM    TestTable3 b, TestTable5 a, TestTable6 c, TestTable7 d,TestTable8 e
+                                     WHERE    B.site_gb       in (
+                                                                    SELECT    cd_minor
+                                                                      FROM    TestTableA1
+                                                                     WHERE    cd_major    = '0072'
+                                                                       AND    cd_fr_minor    = '20'
+                                                                       AND    cd_ref2        = '22'                                     
+                                                                     )
+                                       AND    a.order_id       =        b.order_id
+                                       AND    b.status_cd    =        '12'
+                                       AND    B.ORDER_STATUS =        '12'
+                                       AND    a.order_status =        '12'
+                                       AND  b.order_ret_gb <>       '15'
+                                       AND  c.vendor_tr_gb =        '01'
+                                       AND    b.assort_id       =        c.assort_id
+                                       AND    c.deli_mth       =        '07'
+                                       AND    c.vendor_id       not in ( 'XXXXX1')  
+                                       AND  c.vendor_id    LIKE     h_vendor_id || '%'
+                                       AND    b.deli_id       =        d.deli_id
+                                       AND    b.order_dt     BETWEEN    h_order_dt_from  AND    h_order_dt_to
+                                       AND  c.storage_id   =     h_storage_id
+                                       AND  not exists(select 1||rownum
+                                                            from TestTable3 e
+                                                        where b.order_id = e.bef_order_id
+                                                          and b.order_seq = e.bef_order_seq
+                                                          and e.status_cd = '15')
+                                       and nvl(b.set_gb,'99') <> '02'
+                                       and FLS0051P(b.order_id,b.order_seq) = 'O'
+                                       and c.vendor_id = e.vendor_id
+                                       and e.eff_end_dt = '99991231'
+                                    ) aa
+                            UNION ALL
+                              SELECT    aa.order_id,        aa.order_seq,        aa.deli_mth         ,    aa.vendor_id,        aa.storage_id
+                                 ,    aa.union_apply,        aa.assort_id,        aa.item_id         ,    aa.order_qty,        aa.set_gb
+                                 ,    aa.first_order_gb,    aa.receipt_dt,        aa.ugt_ship_yn     ,    aa.deli_id,            aa.deli_zip
+                                 ,    aa.deli_accur_yn,    aa.deli_dt,            aa.deli_gb         ,    aa.mbe_vendor_id--,    aa.ship_yn
+                                 ,    nvl(aa.negative_yn,'02') negative_yn,   
+                                 (select /*+INDEX( X TestTable2_PK) */ sum(qty - ship_indicate_qty)
+                                    from TestTable2@TestLink X
+                                   where aa.storage_id = storage_id
+                                     and aa.assort_id  = assort_id
+                                     and aa.item_id       = item_id
+                                     and item_grade       ='11') stock_qty
+                                 ,  dense_rank() over(order by aa.order_id, aa.deli_id,aa.union_apply) rnum
+                                 ,  sum(1)         over(partition by aa.order_id, aa.deli_id,aa.union_apply) cnt
+                                 ,  sum(order_qty) over(partition by aa.assort_id, aa.item_id
+                                                            order by aa.deli_accur_yn, aa.ugt_ship_yn, nvl(aa.negative_yn,'02'), aa.first_order_gb,
+                                                                     aa.receipt_dt, aa.order_id) run_sum_order_qty
+                                 ,aa.set_order_seq                                    
+                              FROM (SELECT    /*+ ORDERED USE_NL(b a c d) index(b TestTable3_IND6) - TestProcedure  */
+                                                 b.order_id,    b.order_seq,    c.deli_mth deli_mth
+                                         ,    '002301' vendor_id
+                                         ,     c.storage_id, DECODE(union_apply, '02', TO_CHAR(ROWNUM), union_apply) union_apply,    b.assort_id
+                                         ,    b.item_id,    b.order_qty,     b.set_gb,    NVL(a.first_order_gb,'02') first_order_gb
+                                         ,    a.receipt_dt,    NVL(a.ugt_ship_yn,'02') ugt_ship_yn
+                                         ,    b.deli_id,    d.deli_zip,    NVL(d.deli_accur_yn,'02') deli_accur_yn
+                                         ,    d.deli_dt,    d.deli_gb,    d.vendor_id mbe_vendor_id
+                                         , (SELECT    /*+ index( k TestTable4_IND2) - TestProcedure */ '01'
+                                               FROM    TestTable4 k
+                                             WHERE    k.order_id   = a.order_id
+                                               AND    k.reason_bcd = '02'
+                                               AND  ROWNUM <= 1) negative_yn
+                                          ,b.set_order_seq
+                                      FROM    TestTable3 b, TestTable5 a, TestTable6 c, TestTable7 d
+                                     WHERE    B.site_gb       in (
+                                                                    SELECT    cd_minor
+                                                                      FROM    TestTableA1
+                                                                     WHERE    cd_major    = '0072'
+                                                                       AND    cd_fr_minor    = '20'
+                                                                       AND    cd_ref2        = '22'                                     
+                                                                     )
+                                       AND    a.order_id       =        b.order_id
+                                       AND    b.status_cd    =        '12'
+                                       AND    B.ORDER_STATUS =        '12'
+                                       AND    a.order_status =        '12'
+                                       AND  b.order_ret_gb <>       '15'
+                                       AND  c.vendor_tr_gb =        '01'
+                                       AND    b.assort_id       =        c.assort_id
+                                       AND    c.deli_mth       =        '07'
+                                       AND    c.vendor_id       = '117285'   
+                                       AND  c.vendor_id    LIKE     h_vendor_id || '%'
+                                       AND    b.deli_id       =        d.deli_id
+                                       AND    b.order_dt     BETWEEN    h_order_dt_from  AND    h_order_dt_to
+                                       AND  c.storage_id   =     h_storage_id
+                                       AND  not exists(select 1||rownum
+                                                            from TestTable3 e
+                                                        where b.order_id = e.bef_order_id
+                                                          and b.order_seq = e.bef_order_seq
+                                                          and e.status_cd = '15')
+                                       and b.set_gb is null
+                                       
+                                       union all
+                                       
+                                       SELECT    /*+ ORDERED USE_NL(b a c d) index(b TestTable3_IND6) - TestProcedure  */
+                                                 b.order_id,    b.order_seq,    c.deli_mth deli_mth
+                                         ,    '002301' vendor_id
+                                         ,     c.storage_id, DECODE(union_apply, '02', TO_CHAR(ROWNUM), union_apply) union_apply,    b.assort_id
+                                         ,    b.item_id,    b.order_qty,     b.set_gb,    NVL(a.first_order_gb,'02') first_order_gb
+                                         ,    a.receipt_dt,    NVL(a.ugt_ship_yn,'02') ugt_ship_yn
+                                         ,    b.deli_id,    d.deli_zip,    NVL(d.deli_accur_yn,'02') deli_accur_yn
+                                         ,    d.deli_dt,    d.deli_gb,    d.vendor_id mbe_vendor_id
+                                         , (SELECT    /*+ index( k TestTable4_IND2) - TestProcedure */ '01'
+                                               FROM    TestTable4 k
+                                             WHERE    k.order_id   = a.order_id
+                                               AND    k.reason_bcd = '02'
+                                               AND  ROWNUM <= 1) negative_yn
+                                          ,b.set_order_seq
+                                      FROM    TestTable3 b, TestTable5 a, TestTable6 c, TestTable7 d
+                                     WHERE    B.site_gb       in (
+                                                                    SELECT    cd_minor
+                                                                      FROM    TestTableA1
+                                                                     WHERE    cd_major    = '00xx'
+                                                                       AND    cd_fr_minor    = 'x0'
+                                                                       AND    cd_ref2        = '2x'                                     
+                                                                     )
+                                       AND    a.order_id       =        b.order_id
+                                       AND    b.status_cd    =        '12'
+                                       AND    B.ORDER_STATUS =        '12'
+                                       AND    a.order_status =        '12'
+                                       AND  b.order_ret_gb <>       '15'
+                                       AND  c.vendor_tr_gb =        '01'
+                                       AND    b.assort_id       =        c.assort_id
+                                       AND    c.deli_mth       =        '07'
+                                       AND    c.vendor_id       = '11xxxx'   
+                                       AND  c.vendor_id    LIKE     h_vendor_id || '%'
+                                       AND    b.deli_id       =        d.deli_id
+                                       AND    b.order_dt     BETWEEN    h_order_dt_from  AND    h_order_dt_to
+                                       AND  c.storage_id   =     h_storage_id
+                                       AND  not exists(select 1||rownum
+                                                            from TestTable3 e
+                                                        where b.order_id = e.bef_order_id
+                                                          and b.order_seq = e.bef_order_seq
+                                                          and e.status_cd = '15')
+                                       and b.set_order_seq is not null
+                                                          
+                                    ) aa
+                        
+                                                                
+                       ) V1
+                       order by V1.order_id,V1.order_seq;
+
+       ELSE
+
+           INSERT INTO TestTable0(CREATE_TYPE, CREATE_ID, ORDER_ID, ORDER_SEQ, DELI_MTH, VENDOR_ID, STORAGE_ID,
+                                 UNION_APPLY, ASSORT_ID, ITEM_ID, ORDER_QTY, SET_GB, FIRST_ORDER_GB, RECEIPT_DT,
+                              UGT_SHIP_YN, DELI_ID, DELI_ZIP, DELI_ACCUR_YN, DELI_DT, DELI_GB, MBE_VENDOR_ID,
+                              STOCK_QTY, SHIP_YN, NEGATIVE_YN, TEMPORARY_ID, CREATE_TIME, RUN_YN, CNT)
+                SELECT  h_storage_type,    h_upd_id,            V1.order_id,        V1.order_seq,        V1.deli_mth
+                       ,V1.vendor_id,        V1.storage_id,        V1.union_apply,        V1.assort_id,        V1.item_id
+                       ,V1.order_qty,        V1.set_gb,            V1.first_order_gb,    V1.receipt_dt,        V1.ugt_ship_yn
+                       ,V1.deli_id,            V1.deli_zip,        V1.deli_accur_yn,    V1.deli_dt,            V1.deli_gb
+                       ,V1.mbe_vendor_id,    V1.stock_qty,       V1.ship_yn,            V1.negative_yn
+                       ,LPAD(V1.RNUM,9,'0'),TO_CHAR(SYSDATE,'YYYYMMDDHH24MISS')
+                       ,'02', V1.cnt
+                  FROM (SELECT    /*+ ORDERED USE_NL(AA,AB) */
+                                aa.order_id,        aa.order_seq,        aa.deli_mth         ,    aa.vendor_id,        aa.storage_id
+                             ,    aa.union_apply,        aa.assort_id,        aa.item_id         ,    aa.order_qty,        aa.set_gb
+                             ,    aa.first_order_gb,    aa.receipt_dt,        aa.ugt_ship_yn     ,    aa.deli_id,            aa.deli_zip
+                             ,    aa.deli_accur_yn,    aa.deli_dt,            aa.deli_gb         ,    aa.mbe_vendor_id,    aa.ship_yn
+                             ,    nvl(aa.negative_yn,'02') negative_yn,   NVL(ab.qty,0) - NVL(ab.ship_indicate_qty,0) stock_qty
+                             , dense_rank() over(order by aa.order_id, aa.deli_id,aa.deli_mth,aa.storage_id,aa.union_apply) rnum
+                             , sum(1) over(partition by aa.order_id, aa.deli_id,aa.deli_mth,aa.storage_id,aa.union_apply) cnt
+                          FROM (SELECT    /*+ ORDERED USE_NL(b a c d) index(b TestTable3_IND6) - TestProcedure  */
+                                             b.order_id,    b.order_seq,    c.deli_mth as deli_mth
+                                     ,    DECODE(h_storage_type, '2', c.vendor_id, '3', c.vendor_id, '1','002301') as vendor_id
+                                     ,     c.storage_id,    DECODE(union_apply, '02', TO_CHAR(ROWNUM), union_apply) as union_apply,    b.assort_id
+                                     ,    b.item_id,    b.order_qty,     b.set_gb,    NVL(a.first_order_gb,'02') as first_order_gb
+                                     ,    a.receipt_dt,    NVL(a.ugt_ship_yn,'02') as ugt_ship_yn
+                                     ,    b.deli_id,    d.deli_zip,    NVL(d.deli_accur_yn,'02') as deli_accur_yn
+                                     ,    d.deli_dt,    d.deli_gb,    d.vendor_id as mbe_vendor_id
+                                     ,    DECODE(h_storage_type,'1','02','01') as ship_yn
+                                     ,  '01'
+                                     --,  DECODE(h_storage_type, '1', DECODE(b.item_gubun,'02', DECODE(NVL(c.union_apply,'01'),'02','02','01'),'01'),
+                                     --                           '2', '01', '3', '01', '4','02') as bonus_goods
+                                     , (SELECT    /*+ index( k TestTable4_IND2) - TestProcedure */ '01'
+                                           FROM    TestTable4 k
+                                         WHERE    k.order_id   = a.order_id
+                                           AND    k.reason_bcd = '02'
+                                           AND  ROWNUM <= 1) negative_yn
+                                  FROM    TestTable3 b, TestTable5 a, TestTable6 c, TestTable7 d
+                                 WHERE    a.site_gb       =         '22'
+                                   AND    a.order_id       =        b.order_id
+                                   AND    b.status_cd    =        '12'
+                                   AND    a.order_status =        '12'
+                                   AND  b.order_ret_gb <>       '15'
+                                   AND  c.storage_id   IS NOT NULL
+                                   AND  c.vendor_tr_gb NOT IN  ('01','02','04')
+                                   AND    b.assort_id       =        c.assort_id
+                                   AND    c.deli_mth       IN        (DECODE(h_storage_type,'1','01','2','03','3','07'),
+                                                                       DECODE(h_storage_type,'1','02'), DECODE(h_storage_type,'1','04'),
+                                                                   DECODE(h_storage_type,'1','05'), DECODE(h_storage_type,'1','06'))
+                                   AND    b.deli_id       =        d.deli_id
+                                   AND    a.order_dt     BETWEEN    h_order_dt_from  AND    h_order_dt_to
+                                   AND    a.order_type   LIKE        DECODE(h_order_type, NULL, '1', h_order_type) || '%'
+                                   AND    b.assort_id       LIKE    SUBSTR(h_item_id,1,9) || '%'
+                                    AND    b.item_id       LIKE    SUBSTR(h_item_id,10,4) || '%'
+                                   AND  c.vendor_id    LIKE     h_vendor_id || '%'
+                                   AND  c.storage_id   LIKE     h_storage_id || '%'
+                                   AND  not exists(select 1
+                                                        from TestTable3 e
+                                                    where b.order_id = e.bef_order_id
+                                                      and b.order_seq = e.bef_order_seq
+                                                      and e.status_cd = '15')
+                                ) aa, TestTable2 ab
+                         WHERE    ab.storage_id(+)    =          DECODE(h_storage_type, '1', aa.storage_id )
+                           AND    ab.assort_id(+)        =        DECODE(h_storage_type, '1', aa.assort_id )
+                           AND    ab.item_id(+)       =       DECODE(h_storage_type, '1', aa.item_id )
+                           AND    ab.item_grade(+)    =        '11'
+                           AND    ab.eff_end_dt(+)    =        '99991231'
+                       ) V1,
+                       TestTableA1 T1
+                 WHERE T1.CD_MAJOR = '03aa0'
+                   AND T1.CD_END_DT = '99991231235959'
+                   AND T1.CD_MINOR LIKE as_pack_type||'%'
+                   AND V1.CNT BETWEEN T1.CD_SRANGE_NUM AND T1.CD_ERANGE_NUM;
+                           --AND  aa.bonus_goods        =        DECODE(h_storage_type, '1', '01', '2', '01', '3','01', '4', '02')) V1;
+
+       END IF ;
+    EXCEPTION
+        WHEN OTHERS THEN
+            o_err_cd  := -20005;
+            o_err_msg := '20005-출고지시 예상 자료 생성 오류.(TestProcedure)';
+              RETURN;
+    END;
+
+-- 5. 출고지시 데이터 생성여부 체크하여 다음로직으로 진행 -----------------------------------------------------------------
+    BEGIN
+         SELECT       NVL(MIN('Y'),'N')
+           INTO       v_check
+           FROM       TestTable0
+          WHERE       create_type = h_storage_type
+            AND    create_id = h_upd_id
+            AND    ROWNUM <= 1;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            o_err_cd  := -20006;
+            o_err_msg := '20006-출고지시할 자료가 없습니다.(TestProcedure)';
+              RETURN;
+    END;
+
+    IF    v_check = 'N' THEN
+        o_err_cd  := -20006;
+        o_err_msg := '20006-출고지시할 자료가 없습니다.(TestProcedure)';
+          RETURN;
+    END IF;
+
+    IF    h_storage_type = '1'    THEN
+           OPEN    TestProcedure_CURSOR_02;
+
+        LOOP
+            FETCH    TestProcedure_CURSOR_02
+             INTO    v_order_id, v_temporary_id, v_ugt_ship_yn
+                ,   v_deli_accur_yn, v_negative_yn, v_first_order_gb, v_receipt_dt ;
+
+            EXIT    WHEN TestProcedure_CURSOR_02%NOTFOUND;
+
+            v_ship_item_cnt  := 0;
+            v_stock_item_cnt := 0;
+
+            BEGIN
+                 SELECT     /*+ ORDERED US_NL(B A) TestProcedure    */
+                          COUNT(a.order_seq),  SUM(DECODE(SIGN(a.stock_qty - b.order_qty),-1,0,1))
+                   INTO  v_ship_item_cnt, v_stock_item_cnt
+                   FROM (SELECT order_id, temporary_id, assort_id, item_id, SUM(order_qty) as order_qty
+                           FROM TestTable0
+                          WHERE order_id     = v_order_id
+                            AND temporary_id = v_temporary_id
+                            AND create_type = h_storage_type
+                            AND create_id = h_upd_id
+                          GROUP BY order_id, temporary_id, assort_id, item_id) b,
+                        TestTable0 a
+                  WHERE  a.order_id     = b.order_id
+                    AND  a.temporary_id = b.temporary_id
+                    AND     a.assort_id    = b.assort_id
+                    AND     a.item_id        = b.item_id
+                    AND  a.create_type = h_storage_type
+                    AND  a.create_id = h_upd_id;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    CLOSE TestProcedure_CURSOR_02;
+                    o_err_cd  := -20009;
+                    o_err_msg := '20009-출고지시 예상 자료 생성 오류0.(TestProcedure)';
+                      RETURN;
+            END;
+
+            IF v_ship_item_cnt = v_stock_item_cnt THEN
+                BEGIN
+                   UPDATE /*+ TestProcedure    */
+                             TestTable0 a
+                      SET a.ship_yn      = '01'
+                        , a.stock_qty    = a.stock_qty - (SELECT SUM(order_qty)
+                                                            FROM TestTable0 b
+                                                           WHERE b.order_id     = a.order_id
+                                                             AND b.temporary_id = a.temporary_id
+                                                             AND b.assort_id    = a.assort_id
+                                                             AND b.item_id      = a.item_id
+                                                           GROUP BY b.order_id, b.temporary_id, b.assort_id, b.item_id)
+                    WHERE a.order_id     = v_order_id
+                      AND a.temporary_id = v_temporary_id;
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        CLOSE TestProcedure_CURSOR_02;
+                        o_err_cd  := -20010;
+                        o_err_msg := '20010-출고지시 예상 자료 생성 오류1.(TestProcedure)';
+                          RETURN;
+                END;
+
+                BEGIN
+                   UPDATE /*+ TestProcedure    */
+                             TestTable0
+                      SET ship_yn      = decode(( SELECT DISTINCT a.stock_qty
+                                                    FROM TestTable0 a
+                                                   WHERE a.order_id     = v_order_id
+                                                     AND a.temporary_id = v_temporary_id
+                                                     AND a.assort_id    = TestTable0.assort_id
+                                                     AND a.item_id      = TestTable0.item_id
+                                                     AND a.create_id    = TestTable0.create_id
+                                                     AND a.create_type  = TestTable0.create_type),null,'02',ship_yn)
+                        , stock_qty    = (SELECT DISTINCT a.stock_qty
+                                            FROM TestTable0 a
+                                           WHERE a.order_id     = v_order_id
+                                             AND a.temporary_id = v_temporary_id
+                                             AND a.assort_id    = TestTable0.assort_id
+                                             AND a.item_id      = TestTable0.item_id
+                                             AND a.create_id    = TestTable0.create_id
+                                             AND a.create_type  = TestTable0.create_type)
+                    WHERE (assort_id, item_id) IN ( SELECT assort_id, item_id
+                                                      FROM TestTable0
+                                                     WHERE order_id     = v_order_id
+                                                       AND temporary_id = v_temporary_id );
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        CLOSE TestProcedure_CURSOR_02;
+                        o_err_cd  := -20011;
+                        o_err_msg := v_order_id||'-'||'-'||v_temporary_id||' : 20011-출고지시 예상 자료 생성 오류2.(TestProcedure)';
+                          RETURN;
+                END;
+            ELSE
+                BEGIN
+                update TestTable0 c
+                    set c.ship_yn = '02'
+                where (c.create_type ,c.create_id,c.order_id,c.order_seq) in (
+                        select create_type ,create_id,order_id,order_seq
+                        from TestTable0 a
+                        where set_gb = '04'
+                            and ship_yn = '01'
+                            and order_id     = v_order_id
+                            AND temporary_id = v_temporary_id
+                            and exists (
+                                        select 1
+                                        from TestTable0 b
+                                        where b.order_id = a.order_id
+                                        and b.set_order_seq = a.set_order_seq
+                                        and b.set_gb = '04'
+                                        and b.ship_yn = '02'  
+                                        )
+                        ) ;  
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        CLOSE TestProcedure_CURSOR_02;
+                        o_err_cd  := -20099;
+                        o_err_msg := v_order_id||'-'||'-'||v_temporary_id||' : 20099-세트 재고수량 부족에러.(TestProcedure)';
+                          RETURN;
+                END;                         
+            
+            END IF;
+        END    LOOP;
+        CLOSE TestProcedure_CURSOR_02;
+    END IF;
+    
+    
+    /*신규삽입*/
+    
+    IF    h_storage_type = '1'    THEN
+           OPEN    TestProcedure_TESTA_CURSOR_03;
+
+        LOOP
+            FETCH    TestProcedure_TESTA_CURSOR_03
+             INTO    v_order_id_new         ,v_set_order_seq_new    ,v_ship_yn_new              ;                
+
+            EXIT    WHEN TestProcedure_TESTA_CURSOR_03%NOTFOUND;
+
+
+            if v_ship_yn_new = '02' then
+            
+                
+                BEGIN
+                   UPDATE /*+ TestProcedure_TESTA    */
+                             TestTable0 a
+                      SET a.ship_yn      = '02'
+                    WHERE a.order_id     = v_order_id_new
+                      AND a.set_order_seq = v_set_order_seq_new;
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        CLOSE TestProcedure_TESTA_CURSOR_03;
+                        o_err_cd  := -20010;
+                        o_err_msg := '20010y-출고지시 예상 자료 생성 오류1.(TestProcedure_TESTA)';
+                        dbms_output.put_line (o_err_msg );
+                        
+                        
+                         ROLLBACK;         
+                         BEGIN
+                            INSERT INTO TestTableB1
+                                 ( seqnum,destin,callback,smsmsg_gb,tele_id,
+                                   sm,
+                                   reg_id,reg_dt,upd_id,upd_dt )
+                            VALUES(TestTableB1_seq.NEXTVAL,'0000','000','01','00',
+                                   o_err_msg,
+                                   '00',to_char(sysdate,'yyyymmddhh24miss'),'00',to_char(sysdate,'yyyymmddhh24miss') );                
+             
+                         EXCEPTION
+                               WHEN OTHERS THEN
+                                 o_err_cd  := -20001;
+                                 o_err_msg := '30001-에러SMS발송에러.(TestProcedure_TESTA)';
+                                 dbms_output.put_line (o_err_msg );
+                                 ROLLBACK;
+                            END; 
+                         COMMIT;                         
+                        
+                          RETURN;
+                END;            
+                
+            
+            end if;
+
+        END    LOOP;
+        CLOSE TestProcedure_TESTA_CURSOR_03;
+    END IF;    
+    
+    
+    /*----*/    
+
+
+    o_err_cd  := 0;
+    o_err_msg := '정상처리 되었습니다.';
+    RETURN;
+EXCEPTION
+WHEN OTHERS THEN
+    CLOSE TestProcedure_CURSOR_01;
+    CLOSE TestProcedure_CURSOR_02;
+    ROLLBACK;
+    o_err_cd  := -1;
+    o_err_msg := SQLCODE || '21001-출고지시 예상 자료 생성 오류.(TestProcedure)';
+     RETURN;
+END TestProcedure;
+/
+
